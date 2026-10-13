@@ -1,0 +1,16 @@
+# Secrets and personal data
+.env
+*.db
+*.sqlite
+*.sqlite3
+.garminconnect/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Local tooling
+.claude/
+.DS_Store
