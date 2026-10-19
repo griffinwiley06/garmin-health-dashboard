@@ -4,7 +4,7 @@ A personal health dashboard that pulls daily metrics from Garmin Connect, stores
 
 ![Dashboard screenshot](docs/screenshot.png)
 
-*Shown with sample data.*
+*Health metrics shown are sample data.*
 
 ## What it shows
 
