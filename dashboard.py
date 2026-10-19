@@ -33,20 +33,32 @@ USER_NAME = os.getenv("USER_NAME", "there")
 GCAL_ICS_SOURCES = tuple(
     s.strip() for s in re.split(r"[,\n]", os.getenv("GCAL_ICS_URL", "")) if s.strip()
 )
-# Per-calendar accent colors, cycled in source order.
-CAL_PALETTE = ["#4285F4", "#1D9E75", "#E8A33D", "#A879E6", "#E05C5C", "#24A0A0"]
 # Week runs Sunday -> Saturday.
 WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 
-GREEN = "#1D9E75"
-AMBER = "#E8A33D"
-RED = "#E05C5C"
-GRAY = "#9AA0A6"
-CARD_BG = "#1e1e1e"
+# ---- Palette: black, greys, one light blue accent ----
+BG = "#000000"
+PANEL = "#111315"
+LINE = "#23272C"
+TEXT = "#F2F4F6"
+TEXT_2 = "#A3ABB4"
+TEXT_3 = "#6B737C"
+ACCENT = "#8CCBFF"        # light blue: progress, goals met, improvements
+ACCENT_MUTED = "#35536E"  # same hue, recessive: days short of goal
+WARN = "#E2B65C"          # reserved for a low sleep score
 
-# Used only to estimate BMR (Mifflin-St Jeor) for the Calories card subtext,
-# since garmin_daily only stores a single total-calories figure. Override via
-# .env (BIO_AGE, BIO_SEX, BIO_WEIGHT_LB, BIO_HEIGHT_IN) for an accurate split.
+# Calendar identity colors, validated for color-vision deficiency on the panel
+# surface. A third or later calendar falls back to neutral gray, named in the
+# legend, rather than a generated hue.
+CAL_PALETTE = ["#4797E0", "#2A5DB8"]
+CAL_OVERFLOW = "#8E98A4"
+
+FONT_TEXT = "'Barlow', system-ui, sans-serif"
+FONT_NUM = "'Barlow Condensed', 'Barlow', system-ui, sans-serif"
+
+# Used only to estimate BMR (Mifflin-St Jeor) for the Calories subtext, since
+# garmin_daily only stores a single total-calories figure. Override via .env
+# (BIO_AGE, BIO_SEX, BIO_WEIGHT_LB, BIO_HEIGHT_IN) for an accurate split.
 BIO_AGE = int(os.getenv("BIO_AGE", 30))
 BIO_SEX = os.getenv("BIO_SEX", "male").lower()
 BIO_WEIGHT_LB = float(os.getenv("BIO_WEIGHT_LB", 170))
@@ -55,6 +67,8 @@ BIO_HEIGHT_IN = float(os.getenv("BIO_HEIGHT_IN", 69))
 
 st.set_page_config(page_title="Health Dashboard", layout="wide")
 
+
+# ---------------------------------------------------------------- data access
 
 @st.cache_resource
 def get_connection():
@@ -111,9 +125,13 @@ def _load_ics(source):
         return f.read()
 
 
+def cal_color(index):
+    return CAL_PALETTE[index] if index < len(CAL_PALETTE) else CAL_OVERFLOW
+
+
 @st.cache_data(ttl=300)
 def get_week_events(ics_sources, week_start_iso):
-    """Merge the Mon-Sun week of events from one or more iCal sources.
+    """Merge the Sun-Sat week of events from one or more iCal sources.
 
     Returns (days, calendars, errors) where days is {weekday 0-6: [events]},
     calendars is [{name, color}] for the legend, and errors is [(name, msg)]
@@ -126,7 +144,7 @@ def get_week_events(ics_sources, week_start_iso):
     errors = []
 
     for ci, source in enumerate(ics_sources):
-        color = CAL_PALETTE[ci % len(CAL_PALETTE)]
+        color = cal_color(ci)
         fallback_name = f"Calendar {ci + 1}"
         try:
             cal = ICalendar.from_ical(_load_ics(source))
@@ -144,12 +162,10 @@ def get_week_events(ics_sources, week_start_iso):
             if isinstance(start, datetime.datetime):
                 local = start.astimezone() if start.tzinfo else start
                 day = local.date()
-                all_day = False
                 time_label = local.strftime("%-I:%M %p")
                 sort_key = (1, local.time())
             else:
                 day = start
-                all_day = True
                 time_label = "All day"
                 sort_key = (0, datetime.time.min)
 
@@ -159,10 +175,8 @@ def get_week_events(ics_sources, week_start_iso):
                     {
                         "time": time_label,
                         "summary": str(comp.get("SUMMARY", "(no title)")),
-                        "all_day": all_day,
                         "sort": sort_key,
                         "color": color,
-                        "calendar": name,
                     }
                 )
 
@@ -171,178 +185,243 @@ def get_week_events(ics_sources, week_start_iso):
     return days, calendars, errors
 
 
-def render_html(html):
+# ------------------------------------------------------------------- helpers
+
+def render_html(markup):
     """st.markdown treats lines indented 4+ spaces as code blocks, so strip
     leading whitespace before handing multi-line HTML off to it."""
-    st.markdown(re.sub(r"^[ \t]+", "", html, flags=re.MULTILINE), unsafe_allow_html=True)
+    st.markdown(re.sub(r"^[ \t]+", "", markup, flags=re.MULTILINE), unsafe_allow_html=True)
 
 
-def format_k(value):
-    if value is None or pd.isna(value):
-        return "–"
-    value = int(value)
-    if value >= 1000:
-        return f"{value / 1000:.1f}k"
-    return str(value)
+def is_missing(value):
+    return value is None or pd.isna(value)
 
 
-def diff_status(today_val, avg_val, invert=False):
-    if today_val is None or avg_val is None or pd.isna(today_val) or pd.isna(avg_val):
-        return GRAY, "No 7-day average yet"
-    diff = today_val - avg_val
-    good = diff < -3 if not invert else diff > 3
-    bad = diff > 3 if not invert else diff < -3
-    color = AMBER if bad else GREEN if good else GRAY
-    sign = "+" if diff >= 0 else ""
-    return color, f"{sign}{diff:.0f} vs 7-day avg ({avg_val:.0f})"
+def delta_line(today_val, avg_val, unit, lower_is_better):
+    """Arrow + plain-language comparison to the 7-day average. Improvements get
+    the accent; anything else stays neutral gray, so direction never relies on
+    color alone."""
+    if is_missing(today_val) or is_missing(avg_val):
+        return f'<div class="delta">Not enough history for a 7-day average yet</div>'
+    diff = round(today_val - avg_val)
+    if diff == 0:
+        return f'<div class="delta">Right at your 7-day average of {avg_val:.0f} {unit}</div>'
+    arrow = "&#9650;" if diff > 0 else "&#9660;"
+    word = "above" if diff > 0 else "below"
+    improved = (diff < 0) if lower_is_better else (diff > 0)
+    cls = "delta good" if improved else "delta"
+    return (
+        f'<div class="{cls}"><span class="arrow">{arrow}</span>'
+        f"{abs(diff)} {word} your 7-day average of {avg_val:.0f}</div>"
+    )
 
 
-def sleep_label(score):
-    if score is None or pd.isna(score):
-        return "–", GRAY
+def sleep_rating(score):
+    if is_missing(score):
+        return "No data", TEXT_3
     if score > 80:
-        return "Good", GREEN
+        return "Good", ACCENT
     if score >= 60:
-        return "Fair", AMBER
-    return "Low", RED
+        return "Fair", TEXT_2
+    return "Low", WARN
 
 
 def estimate_bmr():
-    if BIO_SEX.startswith("f"):
-        offset = -161
-    else:
-        offset = 5
+    offset = -161 if BIO_SEX.startswith("f") else 5
     weight_kg = BIO_WEIGHT_LB * 0.453592
     height_cm = BIO_HEIGHT_IN * 2.54
     return 10 * weight_kg + 6.25 * height_cm - 5 * BIO_AGE + offset
 
 
-def steps_ring_svg(steps, goal):
+def duration_seconds(text):
+    """'MM:SS' or 'H:MM:SS' -> seconds."""
+    try:
+        parts = [int(p) for p in str(text).split(":")]
+    except ValueError:
+        return None
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return seconds
+
+
+def format_pace(seconds_per_mile):
+    minutes, seconds = divmod(int(round(seconds_per_mile)), 60)
+    return f"{minutes}:{seconds:02d}"
+
+
+def steps_ring_svg(steps, goal, size=176, stroke=12):
     steps = steps or 0
-    size, stroke = 132, 13
     radius = (size - stroke) / 2
     circumference = 2 * 3.14159265 * radius
     pct = max(0.0, min(steps / goal, 1.0))
     offset = circumference * (1 - pct)
-    center = size / 2
+    c = size / 2
     return f"""
-    <svg width="{size}" height="{size}" viewBox="0 0 {size} {size}">
-        <circle cx="{center}" cy="{center}" r="{radius}" fill="none"
-                stroke="#333" stroke-width="{stroke}"/>
-        <circle cx="{center}" cy="{center}" r="{radius}" fill="none"
-                stroke="{GREEN}" stroke-width="{stroke}" stroke-linecap="round"
-                stroke-dasharray="{circumference:.2f}" stroke-dashoffset="{offset:.2f}"
-                transform="rotate(-90 {center} {center})"/>
+    <svg class="ring" width="{size}" height="{size}" viewBox="0 0 {size} {size}" role="img"
+         aria-label="{pct:.0%} of daily step goal">
+        <circle cx="{c}" cy="{c}" r="{radius}" fill="none" stroke="{LINE}" stroke-width="{stroke}"/>
+        <circle cx="{c}" cy="{c}" r="{radius}" fill="none" stroke="{ACCENT}" stroke-width="{stroke}"
+                stroke-linecap="round" stroke-dasharray="{circumference:.2f}"
+                stroke-dashoffset="{offset:.2f}" transform="rotate(-90 {c} {c})"/>
+        <text x="{c}" y="{c + 2}" text-anchor="middle" dominant-baseline="middle"
+              font-family="Barlow Condensed, Barlow, sans-serif" font-weight="600"
+              font-size="40" fill="{TEXT}">{pct * 100:.0f}%</text>
+        <text x="{c}" y="{c + 30}" text-anchor="middle" font-family="Barlow, sans-serif"
+              font-size="13" fill="{TEXT_3}">of goal</text>
     </svg>
     """
 
 
+# -------------------------------------------------------------------- styles
+
 st.markdown(
     f"""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600&family=Barlow+Condensed:wght@500;600&display=swap');
+
+    .stApp {{ background: {BG}; }}
+    .stApp, .stApp p, .stApp div, .stApp span, .stApp button {{ font-family: {FONT_TEXT}; }}
     header[data-testid="stHeader"] {{ display: none; }}
-    .block-container {{ padding-top: 1.5rem; padding-bottom: 1rem; }}
-    .greeting {{
-        display: flex; justify-content: space-between; align-items: baseline;
-        flex-wrap: wrap; gap: 0.4rem 1.5rem; margin: 0 0 1rem 0;
+    .block-container {{ padding: 2rem 2.5rem 1.5rem; max-width: 1600px; }}
+
+    /* Header */
+    .top {{
+        display: flex; justify-content: space-between; align-items: flex-end;
+        flex-wrap: wrap; gap: 0.5rem 2rem; margin-bottom: 1.6rem;
     }}
-    .greet-hi {{ font-size: 2.5rem; font-weight: 700; color: #fafafa; line-height: 1.1; }}
-    .greet-when {{ font-size: 2rem; color: {GRAY}; white-space: nowrap; }}
-    .card {{
-        background-color: {CARD_BG};
-        border-radius: 12px;
-        padding: 0.8rem 0.9rem;
-        height: 100%;
+    .hello {{
+        font-family: {FONT_NUM}; font-weight: 600; font-size: 3.1rem;
+        line-height: 1; color: {TEXT}; letter-spacing: -0.01em;
+    }}
+    .when {{ text-align: right; }}
+    .when .time {{
+        font-family: {FONT_NUM}; font-weight: 500; font-size: 2.1rem;
+        line-height: 1; color: {TEXT};
+    }}
+    .when .date {{ font-size: 1rem; color: {TEXT_2}; margin-top: 0.3rem; }}
+
+    /* Shared panel */
+    .panel {{
+        background: {PANEL}; border: 1px solid {LINE}; border-radius: 16px;
         box-sizing: border-box;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
     }}
-    .card-title {{
-        font-size: 0.8rem;
-        color: {GRAY};
-        margin-bottom: 0.3rem;
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-    }}
-    .card-big {{ font-size: 1.85rem; font-weight: 700; color: #fafafa; }}
-    .card-sub {{ font-size: 0.82rem; color: {GRAY}; margin-top: 0.15rem; }}
-    .status-line {{ font-size: 0.82rem; font-weight: 600; margin-top: 0.3rem; }}
-    .bento-row1 {{
-        display: grid;
-        grid-template-columns: 1.4fr 1fr 1fr;
-        grid-template-rows: 1fr 1fr;
-        gap: 0.7rem;
-        margin-bottom: 0.7rem;
-    }}
-    .card-steps {{ grid-column: 1; grid-row: 1 / span 2; }}
-    .card-hr {{ grid-column: 2; grid-row: 1; }}
-    .card-sleep {{ grid-column: 3; grid-row: 1; }}
-    .card-hrv {{ grid-column: 2; grid-row: 2; }}
-    .card-cal {{ grid-column: 3; grid-row: 2; }}
-    .steps-inner {{ display: flex; align-items: center; gap: 1.2rem; }}
-    .runs-row {{
+    .panel-head {{
         display: flex; justify-content: space-between; align-items: baseline;
-        padding: 0.4rem 0; border-bottom: 1px solid #2a2a2a; font-size: 0.92rem;
+        gap: 1rem; margin-bottom: 0.9rem;
     }}
-    .runs-row:last-child {{ border-bottom: none; }}
-    .runs-date {{ color: {GRAY}; font-size: 0.85rem; }}
-    .st-key-steps_chart_card {{
-        background-color: {CARD_BG};
-        border-radius: 12px;
-        padding: 0.8rem 0.9rem;
+    .panel-title {{ font-size: 1.05rem; font-weight: 600; color: {TEXT}; }}
+    .panel-note {{ font-size: 0.85rem; color: {TEXT_3}; }}
+
+    /* Row 1: steps hero + vitals */
+    .row1 {{
+        display: grid; grid-template-columns: minmax(340px, 1fr) 1.55fr;
+        gap: 1rem; margin-bottom: 1rem;
     }}
-    .section-title {{
-        font-size: 0.8rem;
-        color: {GRAY};
-        text-transform: uppercase;
-        letter-spacing: 0.04em;
-        margin: 0.8rem 0 0.5rem 0;
+    .hero {{ padding: 1.4rem 1.6rem; display: flex; align-items: center; gap: 1.8rem; }}
+    .hero .label {{ font-size: 0.95rem; color: {TEXT_2}; }}
+    .hero .big {{
+        font-family: {FONT_NUM}; font-weight: 600; font-size: 4.4rem;
+        line-height: 0.95; color: {TEXT}; margin: 0.2rem 0 0.35rem;
     }}
-    .week-grid {{
-        display: grid;
-        grid-template-columns: repeat(7, 1fr);
-        gap: 0.6rem;
+    .hero .sub {{ font-size: 0.95rem; color: {TEXT_2}; }}
+    .hero .sub strong {{ color: {TEXT}; font-weight: 600; }}
+    .hero .meta {{ font-size: 0.85rem; color: {TEXT_3}; margin-top: 0.9rem; }}
+
+    .vitals {{
+        display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: 1fr 1fr;
+        overflow: hidden;
     }}
-    .day-col {{
-        background-color: {CARD_BG};
-        border-radius: 12px;
-        padding: 0.55rem 0.5rem;
-        min-height: 88px;
-        border: 1px solid transparent;
+    .vital {{ padding: 1.05rem 1.4rem; }}
+    .vital:nth-child(1), .vital:nth-child(2) {{ border-bottom: 1px solid {LINE}; }}
+    .vital:nth-child(odd) {{ border-right: 1px solid {LINE}; }}
+    .vital .label {{ font-size: 0.9rem; color: {TEXT_2}; }}
+    .vital .value {{
+        font-family: {FONT_NUM}; font-weight: 600; font-size: 2.6rem;
+        line-height: 1; color: {TEXT}; margin: 0.35rem 0 0.4rem;
     }}
-    .day-col.today {{ border-color: {GREEN}; }}
-    .day-head {{
-        font-size: 0.72rem; color: {GRAY};
-        text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 0.5rem;
+    .vital .unit {{ font-family: {FONT_TEXT}; font-size: 0.95rem; font-weight: 500; color: {TEXT_3}; margin-left: 0.25rem; }}
+    .delta {{ font-size: 0.85rem; color: {TEXT_2}; }}
+    .delta.good {{ color: {ACCENT}; }}
+    .delta .arrow {{ font-size: 0.65rem; margin-right: 0.35rem; position: relative; top: -1px; }}
+    .meter {{ height: 4px; background: {LINE}; border-radius: 2px; margin: 0.15rem 0 0.5rem; max-width: 220px; }}
+    .meter > span {{ display: block; height: 100%; border-radius: 2px; }}
+
+    /* Row 2: steps chart (Streamlit container) + running */
+    .st-key-steps_panel {{
+        background: {PANEL}; border: 1px solid {LINE}; border-radius: 16px;
+        padding: 1.2rem 1.4rem 0.6rem; min-height: 340px;
     }}
-    .day-head .num {{
-        display: block; color: #fafafa; font-weight: 700; font-size: 1.15rem;
+    .st-key-steps_panel [data-testid="stVerticalBlock"] {{ gap: 0; }}
+    .keys {{ display: flex; gap: 1.1rem; font-size: 0.85rem; color: {TEXT_2}; }}
+    .key {{ display: inline-flex; align-items: center; gap: 0.45rem; }}
+    .key .swatch {{ width: 10px; height: 10px; border-radius: 3px; display: inline-block; }}
+    .key .rule {{ width: 16px; height: 0; display: inline-block; border-top: 2px solid {TEXT_2}; }}
+    .key .rule.avg {{ border-top: 2px dotted {TEXT_3}; }}
+
+    .runs {{ padding: 1.2rem 1.4rem; min-height: 340px; }}
+    .runs .total {{ display: flex; align-items: baseline; gap: 0.5rem; }}
+    .runs .total .num {{
+        font-family: {FONT_NUM}; font-weight: 600; font-size: 4rem; line-height: 0.95; color: {TEXT};
     }}
-    .day-col.today .day-head .num {{ color: {GREEN}; }}
+    .runs .total .word {{ font-size: 1.05rem; color: {TEXT_2}; }}
+    .runs .summary {{ font-size: 0.95rem; color: {TEXT_2}; margin: 0.45rem 0 1.2rem; }}
+    .runs .summary strong {{ color: {TEXT}; font-weight: 600; }}
+    .run {{
+        display: grid; grid-template-columns: 2.6rem 1fr 4.6rem; align-items: center;
+        gap: 0.8rem; padding: 0.5rem 0;
+    }}
+    .run + .run {{ border-top: 1px solid {LINE}; }}
+    .run .run-day {{ font-size: 0.9rem; color: {TEXT_2}; }}
+    .run .track {{ display: flex; align-items: center; gap: 0.6rem; min-width: 0; }}
+    .run .bar {{ height: 8px; border-radius: 0 4px 4px 0; background: {ACCENT}; flex: none; }}
+    .run .dist {{ font-family: {FONT_NUM}; font-size: 1.2rem; font-weight: 600; color: {TEXT}; white-space: nowrap; }}
+    .run .pace {{ text-align: right; font-size: 0.9rem; color: {TEXT_2}; font-variant-numeric: tabular-nums; white-space: nowrap; }}
+    .run .pace small {{ color: {TEXT_3}; font-size: 0.75rem; }}
+    .empty {{ font-size: 0.95rem; color: {TEXT_3}; }}
+
+    /* Row 3: calendar */
+    .cal-wrap {{ margin-top: 1.6rem; }}
+    .cal-title {{ font-size: 1.05rem; font-weight: 600; color: {TEXT}; }}
+    .cal-legend {{ display: inline-flex; gap: 1rem; margin-left: 1.2rem; font-size: 0.85rem; color: {TEXT_2}; font-weight: 400; }}
+    div[class*="st-key-cal_"] button {{
+        min-height: 0; height: 32px; padding: 0 0.85rem; border-radius: 8px;
+        background: transparent; border: 1px solid {LINE}; color: {TEXT_2};
+        font-size: 0.85rem; line-height: 1;
+    }}
+    div[class*="st-key-cal_"] button:hover {{ border-color: {TEXT_3}; color: {TEXT}; background: {PANEL}; }}
+    div[class*="st-key-cal_"] button:focus-visible {{ outline: 2px solid {ACCENT}; outline-offset: 2px; }}
+    div[class*="st-key-cal_"] button:disabled {{ opacity: 0.4; }}
+    .week {{ display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 0.6rem; margin-top: 0.8rem; }}
+    .day {{
+        background: {PANEL}; border: 1px solid {LINE}; border-radius: 12px;
+        padding: 0.7rem 0.6rem 0.5rem; min-height: 120px; position: relative; overflow: hidden;
+    }}
+    .day.today::before {{
+        content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: {ACCENT};
+    }}
+    .day-head {{ display: flex; align-items: baseline; gap: 0.4rem; margin-bottom: 0.6rem; }}
+    .day-head .dow {{ font-size: 0.85rem; color: {TEXT_2}; }}
+    .day-head .num {{ font-family: {FONT_NUM}; font-size: 1.45rem; font-weight: 600; color: {TEXT}; line-height: 1; }}
+    .day.today .day-head .num {{ color: {ACCENT}; }}
     .evt {{
-        background-color: #2a2a2a; border-radius: 6px;
-        border-left: 3px solid {GRAY};
-        padding: 0.3rem 0.4rem; margin-bottom: 0.35rem;
-        font-size: 0.76rem; line-height: 1.25; color: #eaeaea;
+        border-left: 3px solid {CAL_OVERFLOW}; padding: 0.15rem 0 0.15rem 0.5rem;
+        margin-bottom: 0.55rem; line-height: 1.25;
     }}
-    .evt .t {{ display: block; font-size: 0.68rem; }}
-    .evt-empty {{ color: #555; font-size: 0.85rem; }}
-    .cal-legend {{
-        display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem;
-        margin: -0.35rem 0 0.85rem 0;
-    }}
-    .cal-chip {{
-        display: inline-flex; align-items: center; gap: 0.4rem;
-        font-size: 0.78rem; color: {GRAY};
-    }}
-    .cal-chip .dot {{
-        width: 10px; height: 10px; border-radius: 3px; display: inline-block;
+    .evt .t {{ display: block; font-size: 0.72rem; color: {TEXT_3}; font-variant-numeric: tabular-nums; }}
+    .evt .s {{ font-size: 0.82rem; color: {TEXT}; }}
+    .day .none {{ font-size: 0.8rem; color: {TEXT_3}; }}
+
+    @media (max-width: 1100px) {{
+        .row1 {{ grid-template-columns: 1fr; }}
+        .week {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
     }}
     </style>
     """,
     unsafe_allow_html=True,
 )
+
+# -------------------------------------------------------------------- header
 
 now = datetime.datetime.now()
 if now.hour < 12:
@@ -352,59 +431,60 @@ elif now.hour < 17:
 else:
     greeting = "Good evening"
 render_html(
-    f'<div class="greeting">'
-    f'<div class="greet-hi">{greeting}, {html.escape(USER_NAME)}</div>'
-    f'<div class="greet-when">{now.strftime("%A, %B %-d, %Y")} &middot; '
-    f'{now.strftime("%-I:%M %p")}</div>'
+    f'<div class="top">'
+    f'<div class="hello">{greeting}, {html.escape(USER_NAME)}</div>'
+    f'<div class="when"><div class="time">{now.strftime("%-I:%M %p")}</div>'
+    f'<div class="date">{now.strftime("%A, %B %-d")}</div></div>'
     f"</div>"
 )
 
 # Floating fullscreen toggle. Injected into the parent document so the click
 # is a real user gesture on the top page (required to enter fullscreen).
 components.html(
-    """
+    f"""
     <script>
-    (function () {
+    (function () {{
         const doc = window.parent.document;
         if (doc.getElementById('fs-toggle')) return;
         const btn = doc.createElement('button');
         btn.id = 'fs-toggle';
         btn.type = 'button';
         btn.title = 'Toggle fullscreen';
+        btn.setAttribute('aria-label', 'Toggle fullscreen');
         btn.innerHTML = '\\u26F6';
         btn.style.cssText =
-            'position:fixed;top:12px;right:14px;z-index:100000;width:38px;height:38px;'
-            + 'border-radius:10px;border:1px solid #333;background:#1e1e1e;color:#eaeaea;'
-            + 'font-size:18px;cursor:pointer;display:flex;align-items:center;'
-            + 'justify-content:center;line-height:1;box-shadow:0 2px 8px rgba(0,0,0,0.45);';
-        btn.onmouseenter = function () { btn.style.background = '#2a2a2a'; };
-        btn.onmouseleave = function () { btn.style.background = '#1e1e1e'; };
-        const sync = function () {
+            'position:fixed;top:12px;right:14px;z-index:100000;width:34px;height:34px;'
+            + 'border-radius:8px;border:1px solid {LINE};background:{PANEL};color:{TEXT_2};'
+            + 'font-size:16px;cursor:pointer;display:flex;align-items:center;'
+            + 'justify-content:center;line-height:1;opacity:0.6;';
+        btn.onmouseenter = function () {{ btn.style.opacity = '1'; }};
+        btn.onmouseleave = function () {{ btn.style.opacity = '0.6'; }};
+        const sync = function () {{
             btn.innerHTML = doc.fullscreenElement ? '\\u2715' : '\\u26F6';
-        };
-        btn.onclick = function () {
-            if (doc.fullscreenElement) {
+        }};
+        btn.onclick = function () {{
+            if (doc.fullscreenElement) {{
                 doc.exitFullscreen();
-            } else {
+            }} else {{
                 const p = doc.documentElement.requestFullscreen();
-                if (p && p.catch) p.catch(function () {});
-            }
-        };
+                if (p && p.catch) p.catch(function () {{}});
+            }}
+        }};
         doc.addEventListener('fullscreenchange', sync);
         doc.body.appendChild(btn);
-    })();
+    }})();
     </script>
     """,
     height=0,
 )
 
+# ---------------------------------------------------------------------- data
+
 conn = get_connection()
 
 tables = {
     row[0]
-    for row in conn.execute(
-        "SELECT name FROM sqlite_master WHERE type='table'"
-    ).fetchall()
+    for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
 }
 if not {"garmin_daily", "garmin_runs"}.issubset(tables):
     st.warning(
@@ -413,11 +493,12 @@ if not {"garmin_daily", "garmin_runs"}.issubset(tables):
     )
     st.stop()
 
-today = datetime.date.today().isoformat()
+today_date = datetime.date.today()
+today = today_date.isoformat()
 today_row = get_today_row(conn, today)
 
 if today_row is None:
-    st.warning("No data found in health.db yet. Run pull_garmin.py to populate it.")
+    st.warning("No data found in health.db yet. Run `python pull_garmin.py full` to populate it.")
     st.stop()
 
 steps = today_row["steps"] if pd.notna(today_row["steps"]) else 0
@@ -429,114 +510,186 @@ hrv = today_row["hrv"] if pd.notna(today_row["hrv"]) else None
 avg_hr = get_week_avg(conn, "resting_hr")
 avg_hrv = get_week_avg(conn, "hrv")
 
-hr_color, hr_status_text = diff_status(resting_hr, avg_hr, invert=False)
-hrv_color, hrv_status_text = diff_status(hrv, avg_hrv, invert=True)
-sleep_text, sleep_color = sleep_label(sleep_score)
+steps_df = get_last_7_days_steps(conn)
+past_steps = steps_df[steps_df["date"].astype(str).str[:10] != today]["steps"].dropna()
+avg_steps = past_steps.mean() if not past_steps.empty else None
+
+# --------------------------------------------------------- row 1: steps + vitals
+
+remaining = STEP_GOAL - steps
+if remaining > 0:
+    progress = f"<strong>{remaining:,.0f}</strong> more to reach"
+else:
+    progress = f"<strong>{-remaining:,.0f}</strong> past your goal of"
+avg_text = f"Your 7-day average is {avg_steps:,.0f}" if avg_steps is not None else ""
+
+sleep_text, sleep_color = sleep_rating(sleep_score)
+sleep_pct = 0 if is_missing(sleep_score) else max(0, min(sleep_score, 100))
 
 bmr = estimate_bmr()
 if calories is not None:
     active = max(calories - bmr, 0)
-    cal_sub = f"{bmr:.0f} BMR + {active:.0f} active (est.)"
+    cal_sub = f"About {bmr:,.0f} resting and {active:,.0f} active"
 else:
-    cal_sub = "No data"
+    cal_sub = "No data yet today"
 
-row1_html = f"""
-<div class="bento-row1">
-    <div class="card card-steps">
-        <div class="card-title">Steps today</div>
-        <div class="steps-inner">
+
+def num(value, fmt="{:.0f}"):
+    return "&ndash;" if is_missing(value) else fmt.format(value)
+
+
+render_html(
+    f"""
+    <div class="row1">
+        <div class="panel hero">
             {steps_ring_svg(steps, STEP_GOAL)}
             <div>
-                <div class="card-big">{steps:,.0f}</div>
-                <div class="card-sub">of {STEP_GOAL:,} step goal</div>
+                <div class="label">Steps today</div>
+                <div class="big">{steps:,.0f}</div>
+                <div class="sub">{progress} {STEP_GOAL:,}</div>
+                <div class="meta">{avg_text}</div>
+            </div>
+        </div>
+        <div class="panel vitals">
+            <div class="vital">
+                <div class="label">Resting heart rate</div>
+                <div class="value">{num(resting_hr)}<span class="unit">bpm</span></div>
+                {delta_line(resting_hr, avg_hr, "bpm", lower_is_better=True)}
+            </div>
+            <div class="vital">
+                <div class="label">Heart rate variability</div>
+                <div class="value">{num(hrv)}<span class="unit">ms</span></div>
+                {delta_line(hrv, avg_hrv, "ms", lower_is_better=False)}
+            </div>
+            <div class="vital">
+                <div class="label">Sleep score</div>
+                <div class="value">{num(sleep_score)}<span class="unit">/ 100</span></div>
+                <div class="meter"><span style="width:{sleep_pct}%;background:{sleep_color};"></span></div>
+                <div class="delta" style="color:{sleep_color};">{sleep_text}</div>
+            </div>
+            <div class="vital">
+                <div class="label">Calories burned</div>
+                <div class="value">{num(calories, "{:,.0f}")}<span class="unit">kcal</span></div>
+                <div class="delta">{cal_sub}</div>
             </div>
         </div>
     </div>
-    <div class="card card-hr">
-        <div class="card-title">Resting HR</div>
-        <div class="card-big">{f"{resting_hr:.0f}" if resting_hr is not None else "–"} <span style="font-size:1rem;color:{GRAY};">bpm</span></div>
-        <div class="status-line" style="color:{hr_color};">{hr_status_text}</div>
-    </div>
-    <div class="card card-sleep">
-        <div class="card-title">Sleep score</div>
-        <div class="card-big">{f"{sleep_score:.0f}" if sleep_score is not None else "–"}</div>
-        <div class="status-line" style="color:{sleep_color};">{sleep_text}</div>
-    </div>
-    <div class="card card-hrv">
-        <div class="card-title">HRV</div>
-        <div class="card-big">{f"{hrv:.0f}" if hrv is not None else "–"} <span style="font-size:1rem;color:{GRAY};">ms</span></div>
-        <div class="status-line" style="color:{hrv_color};">{hrv_status_text}</div>
-    </div>
-    <div class="card card-cal">
-        <div class="card-title">Calories</div>
-        <div class="card-big">{f"{calories:,.0f}" if calories is not None else "–"}</div>
-        <div class="card-sub">{cal_sub}</div>
-    </div>
-</div>
-"""
-render_html(row1_html)
+    """
+)
 
-left, right = st.columns([1.6, 1])
+# ------------------------------------------------ row 2: steps chart + running
+
+left, right = st.columns([1.6, 1], gap="medium")
 
 with left:
-    with st.container(key="steps_chart_card"):
-        st.markdown('<div class="card-title">Steps, last 7 days</div>', unsafe_allow_html=True)
-        steps_df = get_last_7_days_steps(conn)
+    with st.container(key="steps_panel"):
+        render_html(
+            f"""
+            <div class="panel-head">
+                <div class="panel-title">Steps this week</div>
+                <div class="keys">
+                    <span class="key"><span class="swatch" style="background:{ACCENT}"></span>Goal met</span>
+                    <span class="key"><span class="swatch" style="background:{ACCENT_MUTED}"></span>Short of goal</span>
+                    <span class="key"><span class="rule"></span>Goal</span>
+                    <span class="key"><span class="rule avg"></span>7-day average</span>
+                </div>
+            </div>
+            """
+        )
         if steps_df.empty:
-            st.caption("No step data in the last 7 days.")
+            render_html('<div class="empty">No step data in the last 7 days.</div>')
         else:
-            labels = [format_k(v) for v in steps_df["steps"]]
-            x_labels = [
-                datetime.date.fromisoformat(str(d)[:10]).strftime("%b %-d")
-                for d in steps_df["date"]
-            ]
+            dates = [datetime.date.fromisoformat(str(d)[:10]) for d in steps_df["date"]]
+            labels = ["Today" if d == today_date else d.strftime("%a %-d") for d in dates]
+            values = steps_df["steps"].fillna(0).tolist()
+            colors = [ACCENT if v >= STEP_GOAL else ACCENT_MUTED for v in values]
+            y_max = max(max(values), STEP_GOAL) * 1.18
+
             fig = go.Figure(
-                go.Scatter(
-                    x=x_labels,
-                    y=steps_df["steps"],
-                    mode="lines+markers+text",
-                    text=labels,
-                    textposition="top center",
-                    textfont=dict(color="#fafafa", size=13),
-                    line=dict(color=GREEN, width=3),
-                    marker=dict(color=GREEN, size=8),
+                go.Bar(
+                    x=labels,
+                    y=values,
+                    marker=dict(color=colors, line=dict(width=0)),
+                    width=0.34,
+                    hovertemplate="%{x}<br><b>%{y:,.0f}</b> steps<extra></extra>",
                 )
             )
+            fig.add_hline(y=STEP_GOAL, line=dict(color=TEXT_2, width=1.5))
+            if avg_steps is not None:
+                fig.add_hline(y=avg_steps, line=dict(color=TEXT_3, width=1.5, dash="dot"))
+            # Direct label on today's bar only; the axis and tooltip carry the rest.
+            fig.add_annotation(
+                x=labels[-1], y=values[-1], text=f"{values[-1]:,.0f}", showarrow=False,
+                yshift=14, font=dict(family=FONT_NUM, size=15, color=TEXT),
+            )
             fig.update_layout(
-                paper_bgcolor=CARD_BG,
-                plot_bgcolor=CARD_BG,
-                margin=dict(l=10, r=10, t=30, b=10),
-                height=200,
-                xaxis=dict(showgrid=False, color=GRAY, type="category"),
-                yaxis=dict(
-                    showgrid=False,
-                    showticklabels=False,
-                    zeroline=False,
-                    range=[0, steps_df["steps"].max() * 1.25],
-                ),
+                barcornerradius=4,
+                paper_bgcolor=PANEL,
+                plot_bgcolor=PANEL,
+                margin=dict(l=4, r=4, t=8, b=4),
+                height=304,
                 showlegend=False,
+                bargap=0.4,
+                font=dict(family=FONT_TEXT, color=TEXT_2, size=13),
+                hoverlabel=dict(bgcolor="#1B1F23", bordercolor=LINE, font=dict(family=FONT_TEXT, color=TEXT)),
+                xaxis=dict(showgrid=False, type="category", tickfont=dict(color=TEXT_2), fixedrange=True),
+                yaxis=dict(
+                    range=[0, y_max], gridcolor=LINE, gridwidth=1, zeroline=False,
+                    tickvals=[0, 5000, 10000, 15000, 20000], ticktext=["0", "5k", "10k", "15k", "20k"],
+                    tickfont=dict(color=TEXT_3, size=12), fixedrange=True, ticks="", side="left",
+                ),
             )
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
 with right:
     runs_df = get_recent_runs(conn)
-    rows_html = ""
-    if runs_df.empty:
-        rows_html = '<div class="card-sub">No recent runs.</div>'
+    cutoff = today_date - datetime.timedelta(days=6)
+    week_runs = []
+    for _, r in runs_df.iterrows():
+        run_day = datetime.date.fromisoformat(str(r["date"])[:10])
+        if run_day < cutoff:
+            continue
+        secs = duration_seconds(r["duration"])
+        dist = float(r["distance_mi"] or 0)
+        pace = secs / dist if secs and dist > 0 else None
+        week_runs.append({"day": run_day, "dist": dist, "pace": pace})
+
+    if not week_runs:
+        body = '<div class="empty">No runs logged in the last 7 days.</div>'
     else:
-        for _, r in runs_df.iterrows():
-            date_str = str(r["date"]).split(" ")[0]
-            rows_html += f"""
-            <div class="runs-row">
-                <span class="runs-date">{date_str}</span>
-                <span>{r['distance_mi']:.1f} mi</span>
-                <span>{r['duration']}</span>
-            </div>
-            """
-    render_html(f'<div class="card"><div class="card-title">Recent runs</div>{rows_html}</div>')
+        total = sum(r["dist"] for r in week_runs)
+        longest = max(r["dist"] for r in week_runs)
+        paces = [r["pace"] for r in week_runs if r["pace"]]
+        fastest = min(paces) if paces else None
+        count = len(week_runs)
+        bits = [f"{count} run{'s' if count != 1 else ''}", f"longest <strong>{longest:.1f} mi</strong>"]
+        if fastest:
+            bits.append(f"best pace <strong>{format_pace(fastest)} /mi</strong>")
+        summary = ", ".join(bits[:-1]) + f", and {bits[-1]}" if len(bits) > 2 else " and ".join(bits)
+        summary = summary[0].upper() + summary[1:]
 
+        rows = ""
+        for r in week_runs:
+            width = 100 * r["dist"] / longest if longest else 0
+            pace_html = f'{format_pace(r["pace"])} <small>/mi</small>' if r["pace"] else "&ndash;"
+            rows += (
+                f'<div class="run"><span class="run-day">{r["day"].strftime("%a")}</span>'
+                f'<span class="track"><span class="bar" style="width:calc({width:.0f}% - 3.6rem)"></span>'
+                f'<span class="dist">{r["dist"]:.1f} mi</span></span>'
+                f'<span class="pace">{pace_html}</span></div>'
+            )
+        body = (
+            f'<div class="total"><span class="num">{total:.1f}</span><span class="word">miles this week</span></div>'
+            f'<div class="summary">{summary}.</div>{rows}'
+        )
 
-# ---- Row 3: Google Calendar week view (with prev/next navigation) ----
+    render_html(
+        f'<div class="panel runs"><div class="panel-head"><div class="panel-title">Running</div>'
+        f'<div class="panel-note">Last 7 days</div></div>{body}</div>'
+    )
+
+# ---------------------------------------------------- row 3: calendar week view
+
 if "week_offset" not in st.session_state:
     st.session_state.week_offset = 0
 
@@ -549,69 +702,51 @@ def _reset_week():
     st.session_state.week_offset = 0
 
 
-today_date = datetime.date.today()
 # Week starts Sunday: weekday() is Mon=0..Sun=6, so (weekday+1) % 7 days back.
 current_week_start = today_date - datetime.timedelta(days=(today_date.weekday() + 1) % 7)
 week_offset = st.session_state.week_offset
 week_start = current_week_start + datetime.timedelta(days=7 * week_offset)
+week_title = "This week" if week_offset == 0 else f"Week of {week_start.strftime('%b %-d')}"
 
-if week_offset == 0:
-    week_title = "This week"
-else:
-    week_title = f"Week of {week_start.strftime('%b %-d, %Y')}"
+render_html('<div class="cal-wrap"></div>')
 
 if not GCAL_ICS_SOURCES:
-    st.markdown('<div class="section-title">This week</div>', unsafe_allow_html=True)
     render_html(
-        '<div class="card"><div class="card-sub">'
-        "Set <code>GCAL_ICS_URL</code> in .env to your Google Calendar "
-        "&ldquo;Secret address in iCal format&rdquo; to show your week here. "
-        "Separate multiple calendars with commas."
-        "</div></div>"
+        '<div class="cal-title">This week</div>'
+        '<div class="panel" style="padding:1rem 1.2rem;margin-top:0.8rem;"><div class="empty">'
+        "Add your Google Calendar &ldquo;Secret address in iCal format&rdquo; as "
+        "<code>GCAL_ICS_URL</code> in .env to see your week here. "
+        "Separate multiple calendars with commas.</div></div>"
     )
 else:
-    st.markdown(
-        f'<div class="section-title">{week_title}</div>', unsafe_allow_html=True
-    )
-    nav = st.columns([1.3, 1.3, 1.3, 6.1])
-    nav[0].button(
-        "◀", key="cal_prev", on_click=_shift_week, args=(-1,),
-        help="Previous week", use_container_width=True,
-    )
-    nav[1].button(
-        "Today", key="cal_today", on_click=_reset_week,
-        disabled=week_offset == 0, use_container_width=True,
-    )
-    nav[2].button(
-        "▶", key="cal_next", on_click=_shift_week, args=(1,),
-        help="Next week", use_container_width=True,
-    )
-
     try:
-        week_events, calendars, cal_errors = get_week_events(
-            GCAL_ICS_SOURCES, week_start.isoformat()
-        )
+        week_events, calendars, cal_errors = get_week_events(GCAL_ICS_SOURCES, week_start.isoformat())
     except Exception as exc:
-        week_events = None
-        render_html(
-            f'<div class="card"><div class="card-sub">'
-            f"Couldn't load calendars: {html.escape(str(exc))}</div></div>"
-        )
+        week_events, calendars, cal_errors = None, [], []
+        load_error = str(exc)
 
-    if week_events is not None:
-        if len(calendars) > 1:
-            legend = "".join(
-                f'<span class="cal-chip"><span class="dot" '
-                f'style="background:{c["color"]}"></span>{html.escape(c["name"])}</span>'
-                for c in calendars
-            )
-            render_html(f'<div class="cal-legend">{legend}</div>')
+    legend = ""
+    if len(calendars) > 1:
+        legend = '<span class="cal-legend">' + "".join(
+            f'<span class="key"><span class="swatch" style="background:{c["color"]}"></span>'
+            f'{html.escape(c["name"])}</span>'
+            for c in calendars
+        ) + "</span>"
 
+    head = st.columns([4, 1], vertical_alignment="center")
+    with head[0]:
+        render_html(f'<div class="cal-title">{week_title}{legend}</div>')
+    with head[1]:
+        with st.container(horizontal=True, horizontal_alignment="right", gap="small"):
+            st.button("‹", key="cal_prev", on_click=_shift_week, args=(-1,), help="Previous week")
+            st.button("Today", key="cal_today", on_click=_reset_week, disabled=week_offset == 0)
+            st.button("›", key="cal_next", on_click=_shift_week, args=(1,), help="Next week")
+
+    if week_events is None:
+        render_html(f'<div class="empty">Couldn\'t load your calendars: {html.escape(load_error)}</div>')
+    else:
         for name, msg in cal_errors:
-            render_html(
-                f'<div class="card"><div class="card-sub">'
-                f"Couldn't load {html.escape(name)}: {html.escape(msg)}</div></div>"
-            )
+            render_html(f'<div class="empty">Couldn\'t load {html.escape(name)}: {html.escape(msg)}</div>')
 
         cols_html = ""
         for i in range(7):
@@ -619,19 +754,17 @@ else:
             today_cls = " today" if d == today_date else ""
             events = week_events.get(i, [])
             if events:
-                evts_html = ""
-                for e in events:
-                    evts_html += (
-                        f'<div class="evt" style="border-left-color:{e["color"]};">'
-                        f'<span class="t" style="color:{e["color"]};">'
-                        f'{html.escape(e["time"])}</span>'
-                        f'{html.escape(e["summary"])}</div>'
-                    )
+                evts_html = "".join(
+                    f'<div class="evt" style="border-left-color:{e["color"]};">'
+                    f'<span class="t">{html.escape(e["time"])}</span>'
+                    f'<span class="s">{html.escape(e["summary"])}</span></div>'
+                    for e in events
+                )
             else:
-                evts_html = '<div class="evt-empty">—</div>'
+                evts_html = '<div class="none">Nothing scheduled</div>'
             cols_html += (
-                f'<div class="day-col{today_cls}">'
-                f'<div class="day-head">{WEEKDAYS[i]}<span class="num">{d.day}</span></div>'
-                f"{evts_html}</div>"
+                f'<div class="day{today_cls}">'
+                f'<div class="day-head"><span class="dow">{WEEKDAYS[i]}</span>'
+                f'<span class="num">{d.day}</span></div>{evts_html}</div>'
             )
-        render_html(f'<div class="week-grid">{cols_html}</div>')
+        render_html(f'<div class="week">{cols_html}</div>')

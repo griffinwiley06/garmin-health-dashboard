@@ -1,6 +1,6 @@
 # Garmin Health Dashboard
 
-A personal health dashboard that pulls daily metrics from Garmin Connect, stores them in a local SQLite database, and displays them in a dark, kiosk-style Streamlit app alongside a weekly calendar view.
+A personal health dashboard that pulls daily metrics from Garmin Connect, stores them in a local SQLite database, and displays them in a black, watch-face-style Streamlit app alongside a weekly calendar view.
 
 ![Dashboard screenshot](docs/screenshot.png)
 
@@ -8,12 +8,12 @@ A personal health dashboard that pulls daily metrics from Garmin Connect, stores
 
 ## What it shows
 
-- **Steps today** with a progress ring against a daily goal
-- **Resting heart rate** and **HRV**, each compared to the 7-day average and color-coded
-- **Sleep score** labeled Good / Fair / Low
+- **Steps today** with a progress ring, steps remaining, and your 7-day average
+- **Resting heart rate** and **HRV**, each compared to the 7-day average with a direction arrow
+- **Sleep score** with a meter and a Good / Fair / Low rating
 - **Calories**, split into estimated BMR (Mifflin-St Jeor) and active calories
-- **Steps over the last 7 days** as a Plotly line chart
-- **Recent runs** with distance and duration
+- **Steps this week** as daily Plotly columns measured against your goal line and 7-day average
+- **Running**: weekly mileage, longest run, best pace, and each run's distance and pace per mile
 - **Week-at-a-glance calendar** merged from one or more Google Calendar iCal feeds, with recurring events expanded and week-by-week navigation
 
 ## How it works

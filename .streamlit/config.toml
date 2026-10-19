@@ -1,7 +1,9 @@
 [theme]
 base = "dark"
-backgroundColor = "#0e1117"
-secondaryBackgroundColor = "#1e1e1e"
+backgroundColor = "#000000"
+secondaryBackgroundColor = "#111315"
+primaryColor = "#8CCBFF"
+textColor = "#F2F4F6"
 
 [client]
 # Hide the Deploy button and menu for a clean, kiosk-style dashboard.
