@@ -2,6 +2,10 @@
 
 A personal health dashboard that pulls daily metrics from Garmin Connect, stores them in a local SQLite database, and displays them in a dark, kiosk-style Streamlit app alongside a weekly calendar view.
 
+![Dashboard screenshot](docs/screenshot.png)
+
+*Shown with sample data.*
+
 ## What it shows
 
 - **Steps today** with a progress ring against a daily goal
